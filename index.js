@@ -1,6 +1,5 @@
 const express = require("express");
 const https = require("https");
-const http = require("http");
 const forge = require("node-forge");
 
 const app = express();
@@ -75,6 +74,60 @@ function mtlsRequest(url, options, body) {
   });
 }
 
+// Build the Integra Contador request body
+function buildConsultarBody(escritorio, company, fetch_type, periodo) {
+  const cnpjContribuinte = company.cnpj.replace(/\D/g, "");
+  const cnpjConvenio = (escritorio.cnpj_convenio || "").replace(/\D/g, "");
+  const cpfResponsavel = (escritorio.cpf_responsavel || "").replace(/\D/g, "");
+
+  const body = {
+    contratante: {
+      numero: cnpjConvenio,
+      tipo: 2,
+    },
+    autorPedidoDados: {
+      numero: cpfResponsavel,
+      tipo: 1,
+    },
+    contribuinte: {
+      numero: cnpjContribuinte,
+      tipo: 2,
+    },
+    pedidoDados: {},
+  };
+
+  if (fetch_type === "pgdas") {
+    // Determine if periodo is year (4 digits) or PA (6 digits)
+    const p = (periodo || "").replace(/\D/g, "");
+    let dados;
+    if (p.length === 4) {
+      dados = JSON.stringify({ anoCalendario: p });
+    } else if (p.length === 6) {
+      dados = JSON.stringify({ pa: p });
+    } else {
+      // Default to current year
+      const year = new Date().getFullYear().toString();
+      dados = JSON.stringify({ anoCalendario: year });
+    }
+
+    body.pedidoDados = {
+      idSistema: "PGDASD",
+      idServico: "CONSDECLARACAO13",
+      versaoSistema: "1.0",
+      dados: dados,
+    };
+  } else if (fetch_type === "situacao_fiscal") {
+    body.pedidoDados = {
+      idSistema: "SITFIS",
+      idServico: "SOLICITARPROTOCOLO91",
+      versaoSistema: "1.0",
+      dados: "{}",
+    };
+  }
+
+  return body;
+}
+
 // Health check
 app.get("/", (req, res) => {
   res.json({ status: "ok", service: "serpro-proxy" });
@@ -93,6 +146,9 @@ app.post("/serpro/consultar", authMiddleware, async (req, res) => {
     }
     if (!company?.cnpj) {
       return res.status(400).json({ error: "CNPJ da empresa é obrigatório" });
+    }
+    if (!escritorio?.cnpj_convenio || !escritorio?.cpf_responsavel) {
+      return res.status(400).json({ error: "Dados do escritório (cnpj_convenio + cpf_responsavel) são obrigatórios" });
     }
 
     console.log(`[SERPRO] Consulta ${fetch_type} para CNPJ ${company.cnpj}`);
@@ -169,33 +225,40 @@ app.post("/serpro/consultar", authMiddleware, async (req, res) => {
 
     console.log("[SERPRO] Token obtido com sucesso");
 
-    // 3. API call based on fetch_type
-    let apiUrl;
-    const cnpj = company.cnpj.replace(/\D/g, "");
+    // 3. Build request body and call the correct endpoint
+    const consultarBody = buildConsultarBody(escritorio, company, fetch_type, periodo);
 
+    // Determine the endpoint based on fetch_type
+    let apiUrl;
     if (fetch_type === "pgdas") {
-      const pa = periodo || new Date().toISOString().slice(0, 7).replace("-", "");
-      apiUrl = `https://gateway.apiserpro.serpro.gov.br/integra-contador/v1/pgdasd/${cnpj}/${pa}`;
+      apiUrl = "https://gateway.apiserpro.serpro.gov.br/integra-contador/v1/Consultar";
     } else if (fetch_type === "situacao_fiscal") {
-      apiUrl = `https://gateway.apiserpro.serpro.gov.br/integra-contador/v1/situacao-fiscal/${cnpj}`;
+      // Step 1: Request protocol via /Apoiar
+      apiUrl = "https://gateway.apiserpro.serpro.gov.br/integra-contador/v1/Apoiar";
     } else {
       return res.status(400).json({ error: `fetch_type inválido: ${fetch_type}` });
     }
+
+    const requestBodyStr = JSON.stringify(consultarBody);
+    console.log(`[SERPRO] POST ${apiUrl}`);
+    console.log(`[SERPRO] Body: ${requestBodyStr}`);
 
     let apiResponse;
     try {
       apiResponse = await mtlsRequest(
         apiUrl,
         {
-          method: "GET",
+          method: "POST",
           headers: {
             Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
             Accept: "application/json",
+            "Content-Length": Buffer.byteLength(requestBodyStr),
           },
           key: keyPem,
           cert: certPem,
         },
-        null
+        requestBodyStr
       );
     } catch (e) {
       console.error("[SERPRO] Erro na consulta API:", e.message);
@@ -205,14 +268,16 @@ app.post("/serpro/consultar", authMiddleware, async (req, res) => {
       });
     }
 
+    console.log(`[SERPRO] Response status: ${apiResponse.status}`);
+    console.log(`[SERPRO] Response body: ${apiResponse.body.substring(0, 500)}`);
+
     if (apiResponse.status !== 200) {
       console.error("[SERPRO] API retornou:", apiResponse.status, apiResponse.body);
-      
-      // Return the actual status code from SERPRO instead of always 502
-      const statusCode = apiResponse.status >= 400 && apiResponse.status < 500 
-        ? apiResponse.status 
+
+      const statusCode = apiResponse.status >= 400 && apiResponse.status < 500
+        ? apiResponse.status
         : 502;
-      
+
       return res.status(statusCode).json({
         error: `SERPRO API retornou ${apiResponse.status}`,
         details: apiResponse.body,
@@ -224,6 +289,14 @@ app.post("/serpro/consultar", authMiddleware, async (req, res) => {
       apiData = JSON.parse(apiResponse.body);
     } catch {
       apiData = apiResponse.body;
+    }
+
+    // For situacao_fiscal, if step 1 succeeded we might need step 2
+    // But first let's return step 1 result to validate the connection works
+    if (fetch_type === "situacao_fiscal" && apiData) {
+      console.log("[SERPRO] SITFIS step 1 (Apoiar) response received");
+      // If the response contains a protocol, we could do step 2 (/Emitir)
+      // For now, return the protocol/result from step 1
     }
 
     console.log("[SERPRO] Consulta realizada com sucesso");
