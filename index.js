@@ -205,3 +205,32 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`SERPRO Proxy rodando na porta ${PORT}`);
 });
+ let parsedDetails: any = null;
+      try { parsedDetails = JSON.parse(errText); } catch {}
+      
+      if (proxyResponse.status === 404 || parsedDetails?.error?.includes("404")) {
+      // Detect embedded 404 even when proxy returns 502 (proxy not redeployed yet)
+      const detailsStr = typeof parsedDetails?.details === "string" ? parsedDetails.details : "";
+      const errorStr = typeof parsedDetails?.error === "string" ? parsedDetails.error : "";
+      const combined = `${errorStr} ${detailsStr}`;
+      let effectiveStatus = proxyResponse.status;
+      if (combined.includes("404")) {
+        effectiveStatus = 404;
+        userMessage = "Dados não encontrados no SERPRO. Verifique se a empresa é optante do Simples Nacional e se existe declaração PGDAS-D para o período selecionado.";
+      } else if (proxyResponse.status === 401 || proxyResponse.status === 403) {
+      } else if (combined.includes("401") || combined.includes("403") || proxyResponse.status === 401 || proxyResponse.status === 403) {
+        effectiveStatus = 403;
+        userMessage = "Acesso negado pelo SERPRO. Verifique se a procuração eletrônica está ativa para esta empresa.";
+      }
+      const returnStatus = effectiveStatus >= 400 && effectiveStatus < 500 ? effectiveStatus : 502;
+      
+      return new Response(
+          error: userMessage,
+          details: errText,
+          not_found: returnStatus === 404,
+        }),
+        {
+          status: proxyResponse.status >= 400 && proxyResponse.status < 500 ? proxyResponse.status : 502,
+          status: returnStatus,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
