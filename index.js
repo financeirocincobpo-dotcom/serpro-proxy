@@ -175,14 +175,13 @@ app.post("/serpro/consultar", authMiddleware, async (req, res) => {
     let tokenResponse;
     try {
       tokenResponse = await mtlsRequest(
-        "https://autenticacao.sapi.serpro.gov.br/authenticate",
+        "https://gateway.apiserpro.serpro.gov.br/token",
         {
           method: "POST",
           headers: {
             "Content-Type": "application/x-www-form-urlencoded",
             Authorization: `Basic ${authString}`,
             "Content-Length": Buffer.byteLength(tokenBody),
-            "Role-Type": "TERCEIROS",
           },
           key: keyPem,
           cert: certPem,
